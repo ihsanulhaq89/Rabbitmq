@@ -5,14 +5,8 @@ import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.text.SimpleDateFormat;
 import java.util.Date;
-import java.util.concurrent.BlockingDeque;
-import java.util.concurrent.LinkedBlockingDeque;
 
-import com.rabbitmq.client.Channel;
-import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.ConnectionFactory;
-import com.rabbitmq.client.QueueingConsumer;
-import com.rabbitmq.client.AMQP.Queue.DeclareOk;
 
 import android.app.Activity;
 
@@ -26,27 +20,35 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.TextView;
 
+import rx.Observable;
+import rx.Subscriber;
+import rx.android.schedulers.AndroidSchedulers;
+import rx.schedulers.Schedulers;
+
 public class MainActivity extends Activity {
+    private MessageUtility messages;
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
         setupConnectionFactory();
+        messages = new MessageUtility();
         publishToAMQP();
         setupPubButton();
-
-        final Handler incomingMessageHandler = new Handler() {
-            @Override
-            public void handleMessage(Message msg) {
-                String message = msg.getData().getString("msg");
-                TextView tv = (TextView) findViewById(R.id.textView);
-                Date now = new Date();
-                SimpleDateFormat ft = new SimpleDateFormat("hh:mm:ss");
-                tv.append(ft.format(now) + ' ' + message + '\n');
-            }
-        };
-        subscribe(incomingMessageHandler);
+        subscribe();
+//        final Handler incomingMessageHandler = new Handler() {
+//            @Override
+//            public void handleMessage(Message msg) {
+//                String message = msg.getData().getString("msg");
+//                TextView tv = (TextView) findViewById(R.id.textView);
+//                Date now = new Date();
+//                SimpleDateFormat ft = new SimpleDateFormat("hh:mm:ss");
+//                tv.append(ft.format(now) + ' ' + message + '\n');
+//            }
+//        };
+//        subscribe(incomingMessageHandler);
     }
 
     void setupPubButton() {
@@ -55,33 +57,12 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View arg0) {
                 EditText et = (EditText) findViewById(R.id.text);
-                publishMessage(et.getText().toString());
+                messages.publishMessage(et.getText().toString());
                 et.setText("");
             }
         });
     }
 
-    Thread subscribeThread;
-    Thread publishThread;
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        publishThread.interrupt();
-        subscribeThread.interrupt();
-    }
-
-    private BlockingDeque<String> queue = new LinkedBlockingDeque<String>();
-
-    void publishMessage(String message) {
-        //Adds a message to internal blocking queue
-        try {
-            Log.d("", "[q] " + message);
-            queue.putLast(message);
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
-    }
 
     ConnectionFactory factory = new ConnectionFactory();
 
@@ -89,93 +70,64 @@ public class MainActivity extends Activity {
         String uri = "amqp://guest:guest@localhost";
         try {
             factory.setAutomaticRecoveryEnabled(false);
+           // factory.setUri("amqp://guest:guest@localhost:5672/");
             factory.setUri(uri);
-            //factory.setHost("localhost");
-            //factory.setPort(5672);
+            factory.setHost("localhost");
+            factory.setPort(5672);
         } catch (KeyManagementException | NoSuchAlgorithmException | URISyntaxException e1) {
             e1.printStackTrace();
         }
     }
 
-    void subscribe(final Handler handler) {
-        subscribeThread = new Thread(new Runnable() {
+    void subscribe() {
+        Observable<String> receiveObservable = messages.subscribeToMessages(factory);
+
+        receiveObservable.subscribeOn(Schedulers.io())
+        .observeOn(AndroidSchedulers.mainThread())
+        .subscribe(new Subscriber<String>() {
             @Override
-            public void run() {
-                while (true) {
-                    try {
-                        Connection connection = factory.newConnection();
-                        Channel channel = connection.createChannel();
-                        channel.basicQos(1);
-                        DeclareOk q = channel.queueDeclare();
-                        channel.queueBind(q.getQueue(), "amq.fanout", "chat");
-                        QueueingConsumer consumer = new QueueingConsumer(channel);
-                        channel.basicConsume(q.getQueue(), true, consumer);
+            public void onCompleted() {
 
-                        // Process deliveries
-                        while (true) {
-                            QueueingConsumer.Delivery delivery = consumer.nextDelivery();
+            }
 
-                            String message = new String(delivery.getBody());
-                            Log.d("", "[r] " + message);
+            @Override
+            public void onError(Throwable e) {
 
-                            Message msg = handler.obtainMessage();
-                            Bundle bundle = new Bundle();
+            }
 
-                            bundle.putString("msg", message);
-                            msg.setData(bundle);
-                            handler.sendMessage(msg);
-                        }
-                    } catch (InterruptedException e) {
-                        break;
-                    } catch (Exception e1) {
-                        Log.d("", "Connection broken: " + e1.getClass().getName());
-                        try {
-                            Thread.sleep(4000); //sleep and then try again
-                        } catch (InterruptedException e) {
-                            break;
-                        }
-                    }
-                }
+            @Override
+            public void onNext(String s) {
+                String message = s;
+                TextView tv = (TextView) findViewById(R.id.textView);
+                Date now = new Date();
+                SimpleDateFormat ft = new SimpleDateFormat("hh:mm:ss");
+                tv.append(ft.format(now) + ' ' + message + '\n');
             }
         });
-        subscribeThread.start();
+
     }
 
-    public void publishToAMQP() {
-        publishThread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                while (true) {
-                    try {
-                        Connection connection = factory.newConnection();
-                        Channel ch = connection.createChannel();
-                        ch.confirmSelect();
+    void publishToAMQP() {
+        Observable<String> publishObservable = messages.publishMessagesToAMPG(factory);
 
-                        while (true) {
-                            String message = queue.takeFirst();
-                            try {
-                                ch.basicPublish("amq.fanout", "chat", null, message.getBytes());
-                                Log.d("", "[s] " + message);
-                                ch.waitForConfirmsOrDie();
-                            } catch (Exception e) {
-                                Log.d("", "[f] " + message);
-                                queue.putFirst(message);
-                                throw e;
-                            }
-                        }
-                    } catch (InterruptedException e) {
-                        break;
-                    } catch (Exception e) {
-                        Log.d("", "Connection broken: " + e.getClass().getName());
-                        try {
-                            Thread.sleep(5000); //sleep and then try again
-                        } catch (InterruptedException e1) {
-                            break;
-                        }
-                    }
+        publishObservable.subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe(new Subscriber<String>() {
+                @Override
+                public void onCompleted() {
+
                 }
-            }
-        });
-        publishThread.start();
+
+                @Override
+                public void onError(Throwable e) {
+
+                }
+
+                @Override
+                public void onNext(String message) {
+
+                    Log.d("", "ADDED TO QUEUE: " + message);
+                }
+            });
     }
 }
